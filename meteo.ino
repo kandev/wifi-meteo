@@ -15,7 +15,8 @@ ADC_MODE(ADC_VCC);                //read supply voltage by ESP.getVcc()
 #define _GRN_LED 13
 #define _BLU_LED 14
 #define _DHTPIN 4
-#define _VERSION F("0.193")
+#define _DHTPOWERPIN 5
+#define _VERSION F("0.196")
 #define _PRODUCT F("Meteo-Chupa")
 #define _UPDATE_SERVER F("chupa.kandev.com")
 #define _UPDATE_PORT 80
@@ -35,7 +36,7 @@ String _SSID;
 String _PASS;
 String _ADMIN_PASS = "";
 bool _CLIENT = false;               // are we client or AP?
-bool allow_sleep = true;
+bool allow_sleep = false;
 unsigned long reset_hold = 0;
 volatile int watchdog_counter = 0;
 unsigned long switch_hold_time = 0;
@@ -211,7 +212,10 @@ void wifi_connect() {
       delay(100);
       Serial.print(".");
       yield();
-      if (digitalRead(_PIN_RESET) == 0) return;
+      if (digitalRead(_PIN_RESET) == 0) {
+        allow_sleep = false;
+        return;
+      }
     }
     Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
@@ -225,7 +229,7 @@ void wifi_connect() {
 void onWifiConnect(const WiFiEventStationModeGotIP& event) {
   Serial.println(F("Connected to Wi-Fi."));
   _RED = LOW;
-  _GRN = HIGH;
+  _GRN = 50;
   _BLU = LOW;
 }
 
@@ -234,7 +238,7 @@ void onWifiDisconnect(const WiFiEventStationModeDisconnected& event) {
   wifiReconnectTimer.attach(10, wifi_connect);
   _RED = LOW;
   _GRN = LOW;
-  _BLU = HIGH;
+  _BLU = 50;
 }
 
 void setup()
@@ -245,14 +249,22 @@ void setup()
   pinMode(_GRN_LED, OUTPUT);
   pinMode(_BLU_LED, OUTPUT);
   pinMode(_PIN_RESET, INPUT_PULLUP);  //factory reset
-
-  digitalWrite(_RED_LED, HIGH);
+  pinMode(_DHTPOWERPIN, OUTPUT);
+  digitalWrite(_DHTPOWERPIN, HIGH);
+  analogWrite(_RED_LED, 50);
   digitalWrite(_GRN_LED, LOW);
   digitalWrite(_BLU_LED, LOW);
   Serial.begin(115200); Serial.println();
   Serial.print(_PRODUCT);
   Serial.print(F(", "));
   Serial.println(_VERSION);
+  Serial.print(F("Init: "));
+  //2 sec delay required to init the dht sensor
+  for (int i = 0; i <= 10; i++) {
+    Serial.print(F("."));
+    delay(200);
+  }
+  Serial.println(F("[ok]"));
   dht.begin();
   get_dht();
   MeteoCheck.attach(300, get_dht);
@@ -274,8 +286,9 @@ void setup()
     Serial.println(_HOSTNAME);
     Serial.print(F("Получен ИП адрес: "));
     Serial.println(WiFi.localIP().toString().c_str());
+    allow_sleep = true;
   } else {
-    _BLU = HIGH;
+    _BLU = 50;
   }
 }
 
@@ -296,18 +309,19 @@ void loop() {
 
   // Handle button press
   if ((digitalRead(_PIN_RESET) != 0) and (switch_hold_time >= 100)) {
-    allow_sleep = !allow_sleep;
+    if (_CLIENT)
+      allow_sleep = !allow_sleep;
     if (allow_sleep) {
       Serial.println(F("Sleep enabled!"));
       deep_sleep_countdown.attach(3, go_to_sleep);
       _RED = LOW;
-      _GRN = HIGH;
+      _GRN = 50;
       _BLU = LOW;
     } else {
       Serial.println(F("Sleep disabled!"));
       deep_sleep_countdown.detach();
-      _RED = HIGH;
-      _GRN = HIGH;
+      _RED = 50;
+      _GRN = 20;
       _BLU = LOW;
     }
     switch_hold_time = 0;
@@ -315,10 +329,10 @@ void loop() {
 
   //handle blinking frequency
   if (millis() - blink_millis >= 500) {
-    digitalWrite(_RED_LED, _RED);
-    digitalWrite(_GRN_LED, _GRN);
-    digitalWrite(_BLU_LED, _BLU);
-    delay(2);
+    analogWrite(_RED_LED, _RED);
+    analogWrite(_GRN_LED, _GRN);
+    analogWrite(_BLU_LED, _BLU);
+    delay(3);
     digitalWrite(_RED_LED, LOW);
     digitalWrite(_GRN_LED, LOW);
     digitalWrite(_BLU_LED, LOW);
@@ -334,7 +348,7 @@ void loop() {
     Serial.println(h);
     if (isnan(h) || isnan(t) ) {
       Serial.println(F(" Failed to read from DHT sensor!"));
-      digitalWrite(_RED_LED, HIGH);
+      analogWrite(_RED_LED, 50);
       digitalWrite(_GRN_LED, LOW);
       digitalWrite(_BLU_LED, LOW);
       delay(100);
@@ -356,9 +370,15 @@ void loop() {
   if (digitalRead(_PIN_RESET) == 0) {
     if (switch_moment == 0) switch_moment = millis();
     switch_hold_time = millis() - switch_moment;
-    digitalWrite(_RED_LED, HIGH);
-    digitalWrite(_GRN_LED, LOW);
-    digitalWrite(_BLU_LED, HIGH);
+    if (_CLIENT) {
+      analogWrite(_RED_LED, 50);
+      analogWrite(_GRN_LED, 0);
+      analogWrite(_BLU_LED, 50);
+    } else {
+      analogWrite(_RED_LED, 100);
+      analogWrite(_GRN_LED, 0);
+      analogWrite(_BLU_LED, 0);
+    }
   } else {
     switch_hold_time = 0;
     switch_moment = 0;
@@ -369,4 +389,3 @@ void loop() {
   watchdog_counter = 0;
   yield();
 }
-
