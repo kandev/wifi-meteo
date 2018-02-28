@@ -409,4 +409,3 @@ void handle_showconfig() {
   }
   closeFS();
 }
-
