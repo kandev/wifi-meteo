@@ -1,4 +1,7 @@
 #include <ESP8266WiFi.h>
+extern "C" {
+#include "user_interface.h"
+}
 #include <ESP8266WebServer.h>
 #include <ArduinoJson.h>
 #include "FS.h"
@@ -16,7 +19,7 @@ ADC_MODE(ADC_VCC);                //read supply voltage by ESP.getVcc()
 #define _BLU_LED 14
 #define _DHTPIN 4
 #define _DHTPOWERPIN 5
-#define _VERSION F("0.196")
+#define _VERSION F("0.197")
 #define _PRODUCT F("Meteo-Chupa")
 #define _UPDATE_SERVER F("chupa.kandev.com")
 #define _UPDATE_PORT 80
@@ -24,11 +27,19 @@ ADC_MODE(ADC_VCC);                //read supply voltage by ESP.getVcc()
 #define update_path "/update"
 #define update_username "chupa"
 #define update_password "apuhc"
-#define _DEEPSLEEP_INTERVAL 900   // in seconds, 0 for disable deep sleep
-#define _WATCHDOG_TIMEOUT 600     // in seconds
 #define _PIN_RESET 0
 #define _DHTTYPE DHT22
 #define _CONFIG F("/config.json")
+
+#define BATT_WARNING_VOLTAGE 2.4
+#define WIFI_CONNECT_TIMEOUT_S 20 // in seconds
+#define _WATCHDOG_TIMEOUT 600     // in seconds
+#define _DEEPSLEEP_INTERVAL 900   // in seconds, 0 for disable deep sleep
+
+// RTC-MEM Adresses
+#define RTC_BASE 64
+#define STATE_COLDSTART 0
+#define STATE_SLEEP_WAKE 1
 
 String _HOSTNAME = "";
 
@@ -59,6 +70,9 @@ bool time_moment = true;            //da izmeri li dannite
 byte _RED = LOW;
 byte _GRN = LOW;
 byte _BLU = LOW;
+byte buf[1];
+byte state;
+byte SLEEP_AFTER=5;
 #include "web_static.h"
 
 void watchdog() {
@@ -119,16 +133,18 @@ void go_to_sleep() {
   Serial.print(F("Entering sleep mode for "));
   Serial.print(_DEEPSLEEP_INTERVAL);
   Serial.println(F(" seconds."));
+  buf[0] = 77;
+  system_rtc_mem_write(RTC_BASE, buf, sizeof(buf));
   ESP.deepSleep(_DEEPSLEEP_INTERVAL * 1000000);
 }
 
 bool openFS() {
   if (!SPIFFS.begin()) {
-    Serial.println(F("[ERR] Не може да бъде монтирана файловат система. Ще бъде направен опит за форматиране."));
+    Serial.println(F("[ERR] Unable to mount. Will try to format the flash."));
     if (!SPIFFS.format())
-      Serial.println(F("[ERR] Файловата система не може да бъде форматирана."));
+      Serial.println(F("[ERR] Unable to mount the FS."));
     else
-      Serial.println(F("[OK] Файловата система е форматирана успешно."));
+      Serial.println(F("[OK] Format successfull!"));
     return false;
   }
   return true;
@@ -203,12 +219,11 @@ void wifi_connect() {
     Serial.println(myIP.toString().c_str());
   } else {
     wifiReconnectTimer.detach();
-    Serial.print(F("Connecting to "));
-    Serial.println(_SSID.c_str());
+    Serial.print(F("Connecting: "));
     last_wifi_connect_attempt = millis();
     WiFi.mode(WIFI_STA);
     WiFi.begin(_SSID.c_str(), _PASS.c_str());
-    while ((WiFi.status() != WL_CONNECTED) && ((millis() - last_wifi_connect_attempt) < 20000)) {
+    while ((WiFi.status() != WL_CONNECTED) && ((millis() - last_wifi_connect_attempt) < WIFI_CONNECT_TIMEOUT_S * 1000)) {
       delay(100);
       Serial.print(".");
       yield();
@@ -217,11 +232,10 @@ void wifi_connect() {
         return;
       }
     }
-    Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.println(F("[OK] Connected."));
+      Serial.println(F("[ok]"));
     } else {
-      Serial.println(F("[ERR] Will try again in a minute."));
+      Serial.println(F("[err]"));
     }
   }
 }
@@ -243,8 +257,29 @@ void onWifiDisconnect(const WiFiEventStationModeDisconnected& event) {
 
 void setup()
 {
+  WiFi.forceSleepBegin();
   //watchdog init
   secondTick.attach(1, watchdog);
+  yield();
+  Serial.begin(115200); Serial.println();
+  Serial.print(_PRODUCT);
+  Serial.print(F(", "));
+  Serial.println(_VERSION);
+  system_rtc_mem_read(RTC_BASE, buf, sizeof(buf));
+  Serial.println(buf[0]);
+  if (buf[0] != 77) { // cold start, magic number is nor present
+    state = STATE_COLDSTART;
+    buf[0] = 0;
+    system_rtc_mem_write(RTC_BASE, buf, sizeof(buf));
+    Serial.println(F("[cold boot]"));
+  } else { // reset was due to sleep-wake or external event
+    state = STATE_SLEEP_WAKE;
+    Serial.println(F("[wake up]"));
+  }
+  switch (state) {
+    case STATE_COLDSTART: SLEEP_AFTER=10;
+    case STATE_SLEEP_WAKE: SLEEP_AFTER=2;
+  }
   pinMode(_RED_LED, OUTPUT);
   pinMode(_GRN_LED, OUTPUT);
   pinMode(_BLU_LED, OUTPUT);
@@ -254,10 +289,6 @@ void setup()
   analogWrite(_RED_LED, 50);
   digitalWrite(_GRN_LED, LOW);
   digitalWrite(_BLU_LED, LOW);
-  Serial.begin(115200); Serial.println();
-  Serial.print(_PRODUCT);
-  Serial.print(F(", "));
-  Serial.println(_VERSION);
   Serial.print(F("Init: "));
   //2 sec delay required to init the dht sensor
   for (int i = 0; i <= 10; i++) {
@@ -269,6 +300,7 @@ void setup()
   get_dht();
   MeteoCheck.attach(300, get_dht);
   _CLIENT = loadConfig();
+  WiFi.forceSleepWake();
   wifiConnectHandler = WiFi.onStationModeGotIP(onWifiConnect);
   wifiDisconnectHandler = WiFi.onStationModeDisconnected(onWifiDisconnect);
   wifi_connect();
@@ -282,9 +314,9 @@ void setup()
   server.begin();
   if (_CLIENT) {
     httpUpdater.setup(&server, update_path, update_username, update_password);
-    Serial.print(F("Име: "));
+    Serial.print(F("Hostname: "));
     Serial.println(_HOSTNAME);
-    Serial.print(F("Получен ИП адрес: "));
+    Serial.print(F("IP address: "));
     Serial.println(WiFi.localIP().toString().c_str());
     allow_sleep = true;
   } else {
@@ -313,7 +345,7 @@ void loop() {
       allow_sleep = !allow_sleep;
     if (allow_sleep) {
       Serial.println(F("Sleep enabled!"));
-      deep_sleep_countdown.attach(3, go_to_sleep);
+      deep_sleep_countdown.attach(SLEEP_AFTER, go_to_sleep);
       _RED = LOW;
       _GRN = 50;
       _BLU = LOW;
@@ -360,8 +392,8 @@ void loop() {
       send_data();
       checkforupdate();
       if (_DEEPSLEEP_INTERVAL > 0) {
-        if (allow_sleep)
-          deep_sleep_countdown.attach(3, go_to_sleep);
+        if ((allow_sleep)and(digitalRead(_PIN_RESET) != 0))
+          deep_sleep_countdown.attach(SLEEP_AFTER, go_to_sleep);
       }
     }
     time_moment = false;
