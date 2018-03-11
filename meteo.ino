@@ -19,7 +19,7 @@ ADC_MODE(ADC_VCC);                //read supply voltage by ESP.getVcc()
 #define _BLU_LED 14
 #define _DHTPIN 4
 #define _DHTPOWERPIN 5
-#define _VERSION F("0.197")
+#define _VERSION F("0.199")
 #define _PRODUCT F("Meteo-Chupa")
 #define _UPDATE_SERVER F("chupa.kandev.com")
 #define _UPDATE_PORT 80
@@ -31,10 +31,10 @@ ADC_MODE(ADC_VCC);                //read supply voltage by ESP.getVcc()
 #define _DHTTYPE DHT22
 #define _CONFIG F("/config.json")
 
-#define BATT_WARNING_VOLTAGE 2.4
 #define WIFI_CONNECT_TIMEOUT_S 20 // in seconds
 #define _WATCHDOG_TIMEOUT 600     // in seconds
 #define _DEEPSLEEP_INTERVAL 900   // in seconds, 0 for disable deep sleep
+#define SLEEP_AFTER 3             // stay up that many seconds then sleep
 
 // RTC-MEM Adresses
 #define RTC_BASE 64
@@ -47,7 +47,6 @@ String _SSID;
 String _PASS;
 String _ADMIN_PASS = "";
 bool _CLIENT = false;               // are we client or AP?
-bool allow_sleep = false;
 unsigned long reset_hold = 0;
 volatile int watchdog_counter = 0;
 unsigned long switch_hold_time = 0;
@@ -56,7 +55,6 @@ unsigned long last_wifi_connect_attempt = 0;
 unsigned long blink_millis = 0;
 Ticker secondTick;
 Ticker wifiReconnectTimer;
-Ticker MeteoCheck;                  //dht sensor check
 Ticker deep_sleep_countdown;        //delayed deepsleep
 ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;
@@ -66,13 +64,11 @@ WiFiEventHandler wifiDisconnectHandler;
 DHT dht(_DHTPIN, _DHTTYPE);
 float t = 0;
 float h = 0;
-bool time_moment = true;            //da izmeri li dannite
 byte _RED = LOW;
 byte _GRN = LOW;
 byte _BLU = LOW;
 byte buf[1];
 byte state;
-byte SLEEP_AFTER=5;
 #include "web_static.h"
 
 void watchdog() {
@@ -123,10 +119,6 @@ void send_data() {
   } else {
     Serial.println(F(" Data sent!"));
   }
-}
-
-void get_dht() {
-  time_moment = true;
 }
 
 void go_to_sleep() {
@@ -213,10 +205,9 @@ void wifi_connect() {
     WiFi.mode(WIFI_AP);
     //    WiFi.setOutputPower(1);
     WiFi.softAP(_SSID.c_str(), _PASS.c_str(), random(1, 13));
-    //WiFi.softAPConfig(_IP, _GATE, _MASK);
-    IPAddress myIP = WiFi.softAPIP();
+    //WiFi.softAPConfig(_IP, _GATE, _MASK);  //default is 192.168.4.1
     Serial.print(F("To configure the device, please connect to the wifi network and open http://"));
-    Serial.println(myIP.toString().c_str());
+    Serial.println(WiFi.softAPIP().toString().c_str());
   } else {
     wifiReconnectTimer.detach();
     Serial.print(F("Connecting: "));
@@ -224,24 +215,15 @@ void wifi_connect() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(_SSID.c_str(), _PASS.c_str());
     while ((WiFi.status() != WL_CONNECTED) && ((millis() - last_wifi_connect_attempt) < WIFI_CONNECT_TIMEOUT_S * 1000)) {
-      delay(100);
+      delay(200);
       Serial.print(".");
       yield();
-      if (digitalRead(_PIN_RESET) == 0) {
-        allow_sleep = false;
-        return;
-      }
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println(F("[ok]"));
-    } else {
-      Serial.println(F("[err]"));
     }
   }
 }
 
 void onWifiConnect(const WiFiEventStationModeGotIP& event) {
-  Serial.println(F("Connected to Wi-Fi."));
+  Serial.println(F("[ok]"));
   _RED = LOW;
   _GRN = 50;
   _BLU = LOW;
@@ -276,10 +258,6 @@ void setup()
     state = STATE_SLEEP_WAKE;
     Serial.println(F("[wake up]"));
   }
-  switch (state) {
-    case STATE_COLDSTART: SLEEP_AFTER=10;
-    case STATE_SLEEP_WAKE: SLEEP_AFTER=2;
-  }
   pinMode(_RED_LED, OUTPUT);
   pinMode(_GRN_LED, OUTPUT);
   pinMode(_BLU_LED, OUTPUT);
@@ -297,8 +275,23 @@ void setup()
   }
   Serial.println(F("[ok]"));
   dht.begin();
-  get_dht();
-  MeteoCheck.attach(300, get_dht);
+  h = dht.readHumidity();
+  t = dht.readTemperature();
+  if (isnan(h) || isnan(t) ) {
+    Serial.println(F("Failed to read from DHT sensor!"));
+    analogWrite(_RED_LED, 50);
+    digitalWrite(_GRN_LED, LOW);
+    digitalWrite(_BLU_LED, LOW);
+    delay(100);
+    digitalWrite(_RED_LED, LOW);
+    digitalWrite(_GRN_LED, LOW);
+    digitalWrite(_BLU_LED, LOW);
+  } else {
+    Serial.print(F("Temperature: "));
+    Serial.print(t);
+    Serial.print(F(", Humidity: "));
+    Serial.println(h);
+  }
   _CLIENT = loadConfig();
   WiFi.forceSleepWake();
   wifiConnectHandler = WiFi.onStationModeGotIP(onWifiConnect);
@@ -318,8 +311,17 @@ void setup()
     Serial.println(_HOSTNAME);
     Serial.print(F("IP address: "));
     Serial.println(WiFi.localIP().toString().c_str());
-    allow_sleep = true;
+    checkforupdate();
+    send_data();
+    if (_DEEPSLEEP_INTERVAL > 0) {
+      deep_sleep_countdown.attach(SLEEP_AFTER, go_to_sleep);
+    }
+    _RED = 0;
+    _GRN = 50;
+    _BLU = 0;
   } else {
+    _RED = 0;
+    _GRN = 0;
     _BLU = 50;
   }
 }
@@ -335,27 +337,17 @@ void loop() {
     digitalWrite(_BLU_LED, LOW);
     Serial.println(F("Factory reset initiated!"));
     send_msg(F("Factory reset initiated!"));
-    delay(1000);
     handle_deleteconfig();
   }
 
   // Handle button press
   if ((digitalRead(_PIN_RESET) != 0) and (switch_hold_time >= 100)) {
     if (_CLIENT)
-      allow_sleep = !allow_sleep;
-    if (allow_sleep) {
-      Serial.println(F("Sleep enabled!"));
-      deep_sleep_countdown.attach(SLEEP_AFTER, go_to_sleep);
-      _RED = LOW;
-      _GRN = 50;
-      _BLU = LOW;
-    } else {
-      Serial.println(F("Sleep disabled!"));
       deep_sleep_countdown.detach();
-      _RED = 50;
-      _GRN = 20;
-      _BLU = LOW;
-    }
+    Serial.println(F("Sleep disabled!"));
+    _RED = 50;
+    _GRN = 0;
+    _BLU = 0;
     switch_hold_time = 0;
   }
 
@@ -371,33 +363,6 @@ void loop() {
     blink_millis = millis();
   }
 
-  if (time_moment) {
-    h = dht.readHumidity();
-    t = dht.readTemperature();
-    Serial.print(F("Temperature: "));
-    Serial.print(t);
-    Serial.print(F(", Humidity: "));
-    Serial.println(h);
-    if (isnan(h) || isnan(t) ) {
-      Serial.println(F(" Failed to read from DHT sensor!"));
-      analogWrite(_RED_LED, 50);
-      digitalWrite(_GRN_LED, LOW);
-      digitalWrite(_BLU_LED, LOW);
-      delay(100);
-      digitalWrite(_RED_LED, LOW);
-      digitalWrite(_GRN_LED, LOW);
-      digitalWrite(_BLU_LED, LOW);
-    }
-    if (_CLIENT) {
-      send_data();
-      checkforupdate();
-      if (_DEEPSLEEP_INTERVAL > 0) {
-        if ((allow_sleep)and(digitalRead(_PIN_RESET) != 0))
-          deep_sleep_countdown.attach(SLEEP_AFTER, go_to_sleep);
-      }
-    }
-    time_moment = false;
-  }
   //switch management
   if (digitalRead(_PIN_RESET) == 0) {
     if (switch_moment == 0) switch_moment = millis();
